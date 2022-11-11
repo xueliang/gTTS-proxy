@@ -108,6 +108,8 @@ class gTTS:
         lang="en",
         slow=False,
         lang_check=True,
+        httpsproxy=None,
+        voice = "Female",
         pre_processor_funcs=[
             pre_processors.tone_marks,
             pre_processors.end_of_line,
@@ -136,6 +138,8 @@ class gTTS:
 
         # Translate URL top-level domain
         self.tld = tld
+        
+        self.httpsproxy = httpsproxy
 
         # Language
         self.lang_check = lang_check
@@ -162,6 +166,7 @@ class gTTS:
         # Pre-processors and tokenizer
         self.pre_processor_funcs = pre_processor_funcs
         self.tokenizer_func = tokenizer_func
+        self.voice = voice
 
     def _tokenize(self, text):
         # Pre-clean
@@ -192,43 +197,9 @@ class gTTS:
 
         return min_tokens
 
-    def _prepare_requests(self):
-        """Created the TTS API the request(s) without sending them.
-
-        Returns:
-            list: ``requests.PreparedRequests_``. <https://2.python-requests.org/en/master/api/#requests.PreparedRequest>`_``.
-        """
-        # TTS API URL
-        translate_url = _translate_url(
-            tld=self.tld, path="_/TranslateWebserverUi/data/batchexecute"
-        )
-
-        text_parts = self._tokenize(self.text)
-        log.debug("text_parts: %s", str(text_parts))
-        log.debug("text_parts: %i", len(text_parts))
-        assert text_parts, "No text to send to TTS API"
-
-        prepared_requests = []
-        for idx, part in enumerate(text_parts):
-            data = self._package_rpc(part)
-
-            log.debug("data-%i: %s", idx, data)
-
-            # Request
-            r = requests.Request(
-                method="POST",
-                url=translate_url,
-                data=data,
-                headers=self.GOOGLE_TTS_HEADERS,
-            )
-
-            # Prepare request
-            prepared_requests.append(r.prepare())
-
-        return prepared_requests
-
     def _package_rpc(self, text):
         parameter = [text, self.lang, self.speed, "null"]
+        #parameter = [text, self.lang, self.speed, self.voice]
         escaped_parameter = json.dumps(parameter, separators=(",", ":"))
 
         rpc = [[[self.GOOGLE_TTS_RPC, escaped_parameter, None, "generic"]]]
@@ -256,42 +227,40 @@ class gTTS:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         except:
             pass
+            
+        translate_url = _translate_url(
+            tld=self.tld, path="_/TranslateWebserverUi/data/batchexecute"
+        )
 
-        prepared_requests = self._prepare_requests()
-        for idx, pr in enumerate(prepared_requests):
-            try:
-                with requests.Session() as s:
-                    # Send request
-                    r = s.send(
-                        request=pr, proxies=urllib.request.getproxies(), verify=False
-                    )
+        text_parts = self._tokenize(self.text)
+        log.debug("text_parts: %s", str(text_parts))
+        log.debug("text_parts: %i", len(text_parts))
+        assert text_parts, "No text to send to TTS API"
+        for idx, part in enumerate(text_parts):
+            data = self._package_rpc(part)
 
-                log.debug("headers-%i: %s", idx, r.request.headers)
-                log.debug("url-%i: %s", idx, r.request.url)
-                log.debug("status-%i: %s", idx, r.status_code)
+            log.debug("data-%i: %s", idx, data)
+            if self.httpsproxy:
+                http = urllib3.ProxyManager(self.httpsproxy)
+            else:
+                http = urllib3.PoolManager()
 
-                r.raise_for_status()
-            except requests.exceptions.HTTPError as e:  # pragma: no cover
-                # Request successful, bad response
-                log.debug(str(e))
-                raise gTTSError(tts=self, response=r)
-            except requests.exceptions.RequestException as e:  # pragma: no cover
-                # Request failed
-                log.debug(str(e))
-                raise gTTSError(tts=self)
+            # Sending a GET request and getting back response as HTTPResponse object.
+            resp = http.request("POST", translate_url, body=data,headers=self.GOOGLE_TTS_HEADERS)
+            # Print the returned data.
+            # Prepare request
 
-            # Write
-            for line in r.iter_lines(chunk_size=1024):
-                decoded_line = line.decode("utf-8")
-                if "jQ1olc" in decoded_line:
-                    audio_search = re.search(r'jQ1olc","\[\\"(.*)\\"]', decoded_line)
-                    if audio_search:
-                        as_bytes = audio_search.group(1).encode("ascii")
-                        yield base64.b64decode(as_bytes)
-                    else:
-                        # Request successful, good response,
-                        # no audio stream in response
-                        raise gTTSError(tts=self, response=r)
+            line = resp.data
+            decoded_line = line.decode("utf-8")
+            if "jQ1olc" in decoded_line:
+                audio_search = re.search(r'jQ1olc","\[\\"(.*)\\"]', decoded_line)
+                if audio_search:
+                    as_bytes = audio_search.group(1).encode("ascii")
+                    yield base64.b64decode(as_bytes)
+                else:
+                    # Request successful, good response,
+                    # no audio stream in response
+                    raise gTTSError(tts=self, response=r)
             log.debug("part-%i created", idx)
 
     def write_to_fp(self, fp):
